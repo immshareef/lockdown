@@ -1,21 +1,49 @@
+//! Lockdown v2 encrypted file format.
+//!
+//! Layout (all offsets fixed; nothing variable-length is parsed before
+//! authentication):
+//!
+//! ```text
+//! MAGIC(4) | VERSION(1) | KEM_CT(1568) | NONCE(12) |
+//! ENC_SK(3168) | SK_NONCE(12) | SK_TAG(16) | PAYLOAD_CT(..) | TAG(16)
+//! ```
+//!
+//! PAYLOAD_CT is AES-256-GCM over `meta_len(2, BE) || meta_json || plaintext`,
+//! keyed by HKDF(shared_secret || password_key). ENC_SK is the ML-KEM secret
+//! key encrypted under HKDF(password_key). The original filename and other
+//! metadata exist only inside the authenticated payload.
+
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
+    aead::{AeadInPlace, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{LockdownError, Result};
 
 pub const MAGIC: &[u8; 4] = b"LOCK";
-pub const VERSION: u8 = 0x01;
+pub const VERSION: u8 = 0x02;
 pub const NONCE_SIZE: usize = 12;
 pub const TAG_SIZE: usize = 16;
 pub const KEM_CT_SIZE: usize = 1568;
 pub const KEM_SK_SIZE: usize = 3168;
-pub const METADATA_LEN_SIZE: usize = 2;
+
+/// Bytes before the payload ciphertext: magic, version, KEM ciphertext,
+/// payload nonce, encrypted secret key, SK nonce, SK tag.
+pub const HEADER_SIZE: usize =
+    4 + 1 + KEM_CT_SIZE + NONCE_SIZE + KEM_SK_SIZE + NONCE_SIZE + TAG_SIZE;
+
+// Fixed offsets into the header.
+const OFF_VERSION: usize = 4;
+const OFF_KEM_CT: usize = 5;
+const OFF_NONCE: usize = OFF_KEM_CT + KEM_CT_SIZE;
+const OFF_ENC_SK: usize = OFF_NONCE + NONCE_SIZE;
+const OFF_SK_NONCE: usize = OFF_ENC_SK + KEM_SK_SIZE;
+const OFF_SK_TAG: usize = OFF_SK_NONCE + NONCE_SIZE;
+const OFF_PAYLOAD: usize = OFF_SK_TAG + TAG_SIZE; // == HEADER_SIZE
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileMetadata {
@@ -25,363 +53,197 @@ pub struct FileMetadata {
     pub encrypted_at: u64,
 }
 
-pub struct EncryptionResult {
-    pub kem_ciphertext: Vec<u8>,
-    pub nonce: [u8; NONCE_SIZE],
-    pub metadata_ciphertext: Vec<u8>,
-    pub ciphertext: Vec<u8>,
-    pub tag: [u8; TAG_SIZE],
-    pub encrypted_secret_key: Vec<u8>,
-    pub sk_nonce: [u8; NONCE_SIZE],
-    pub sk_tag: [u8; TAG_SIZE],
-}
-
 pub struct DecryptionResult {
     pub metadata: FileMetadata,
-    pub plaintext: Vec<u8>,
+    pub plaintext: Zeroizing<Vec<u8>>,
 }
 
-pub fn derive_key(shared_secret: &[u8], password_key: &[u8]) -> [u8; 32] {
-    let mut ikm = Vec::with_capacity(shared_secret.len() + password_key.len());
+fn hkdf_32(ikm: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, ikm);
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(info, okm.as_mut())
+        .expect("32 is a valid output length for HKDF-SHA-256");
+    okm
+}
+
+/// Content-encryption key from the KEM shared secret and the password key.
+fn derive_key(shared_secret: &[u8], password_key: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(shared_secret.len() + password_key.len()));
     ikm.extend_from_slice(shared_secret);
     ikm.extend_from_slice(password_key);
-
-    let hk = Hkdf::<Sha256>::new(None, &ikm);
-    let mut okm = [0u8; 32];
-    hk.expand(b"lockdown-aes-key", &mut okm)
-        .expect("32 is a valid length for SHA-256 HKDF");
-
-    ikm.zeroize();
-    okm
+    hkdf_32(&ikm, b"lockdown-aes-key-v2")
 }
 
-pub fn derive_sk_encryption_key(password_key: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(None, password_key);
-    let mut okm = [0u8; 32];
-    hk.expand(b"lockdown-sk-key", &mut okm)
-        .expect("32 is a valid length for SHA-256 HKDF");
-    okm
+/// Key used to encrypt the embedded ML-KEM secret key.
+fn derive_sk_key(password_key: &[u8]) -> Zeroizing<[u8; 32]> {
+    hkdf_32(password_key, b"lockdown-sk-key-v2")
 }
 
-pub fn encrypt_secret_key(secret_key: &[u8], password_key: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_SIZE], [u8; TAG_SIZE])> {
-    let mut sk_key = derive_sk_encryption_key(password_key);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&sk_key));
-
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let encrypted = cipher
-        .encrypt(nonce, Payload { msg: secret_key, aad: b"lockdown-sk" })
-        .map_err(|e| LockdownError::Crypto(format!("SK encryption failed: {}", e)))?;
-
-    let tag_start = encrypted.len() - TAG_SIZE;
-    let mut tag = [0u8; TAG_SIZE];
-    tag.copy_from_slice(&encrypted[tag_start..]);
-
-    let ciphertext = encrypted[..tag_start].to_vec();
-
-    sk_key.zeroize();
-
-    Ok((ciphertext, nonce_bytes, tag))
+/// Reject names that could escape the target directory when rejoined on disk.
+/// Metadata is authenticated, so this is defense-in-depth against files
+/// produced by tampered or buggy peers.
+fn validate_original_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\'])
+        || name.contains('\0')
+        || name.contains(':')
+    {
+        return Err(LockdownError::PathTraversal);
+    }
+    Ok(())
 }
 
-pub fn decrypt_secret_key(encrypted_sk: &[u8], nonce: &[u8; NONCE_SIZE], tag: &[u8; TAG_SIZE], password_key: &[u8]) -> Result<Vec<u8>> {
-    let mut sk_key = derive_sk_encryption_key(password_key);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&sk_key));
-
-    let nonce = Nonce::from_slice(nonce);
-
-    let mut payload = Vec::with_capacity(encrypted_sk.len() + TAG_SIZE);
-    payload.extend_from_slice(encrypted_sk);
-    payload.extend_from_slice(tag);
-
-    let decrypted = cipher
-        .decrypt(nonce, Payload { msg: &payload, aad: b"lockdown-sk" })
-        .map_err(|e| LockdownError::Crypto(format!("SK decryption failed: {}", e)))?;
-
-    sk_key.zeroize();
-
-    Ok(decrypted)
+fn random_nonce() -> [u8; NONCE_SIZE] {
+    let mut nonce = [0u8; NONCE_SIZE];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    nonce
 }
 
+/// Encrypt a secret key under the password-derived SK key.
+/// Returns `ct || tag`.
+fn encrypt_secret_key(secret_key: &[u8], password_key: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_SIZE])> {
+    let sk_key = derive_sk_key(password_key);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(sk_key.as_ref()));
+    let nonce_bytes = random_nonce();
+
+    let mut buf = Zeroizing::new(secret_key.to_vec());
+    cipher
+        .encrypt_in_place(
+            Nonce::from_slice(&nonce_bytes),
+            b"lockdown-sk",
+            &mut *buf,
+        )
+        .map_err(|_| LockdownError::Crypto("SK encryption failed".to_string()))?;
+
+    Ok((buf.to_vec(), nonce_bytes))
+}
+
+/// Decrypt an `ct || tag` secret-key blob. Authentication failure here means
+/// the password is wrong or the file is corrupt.
+fn decrypt_secret_key(
+    encrypted_sk: &[u8],
+    nonce: &[u8],
+    password_key: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    if encrypted_sk.len() != KEM_SK_SIZE + TAG_SIZE {
+        return Err(LockdownError::InvalidFormat);
+    }
+
+    let sk_key = derive_sk_key(password_key);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(sk_key.as_ref()));
+
+    let mut buf = encrypted_sk.to_vec();
+    cipher
+        .decrypt_in_place(Nonce::from_slice(nonce), b"lockdown-sk", &mut buf)
+        .map_err(|_| LockdownError::Crypto("Wrong password or corrupt file".to_string()))?;
+
+    Ok(Zeroizing::new(buf))
+}
+
+/// Encrypt `plaintext` + `metadata` into a complete self-contained file image.
 pub fn encrypt_file(
     plaintext: &[u8],
     metadata: &FileMetadata,
     password_key: &[u8],
-) -> Result<EncryptionResult> {
+) -> Result<Vec<u8>> {
+    validate_original_name(&metadata.original_name)?;
+
     let keypair = crate::crypto::kem::generate_keypair();
-    let (mut shared_secret, kem_ct) = crate::crypto::kem::encapsulate(&keypair.public_key)?;
+    let (shared_secret, kem_ct) = crate::crypto::kem::encapsulate(&keypair.public_key)?;
+    debug_assert_eq!(kem_ct.len(), KEM_CT_SIZE);
 
-    let mut key = derive_key(&shared_secret, password_key);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let metadata_json = Zeroizing::new(serde_json::to_vec(metadata)?);
+    if metadata_json.len() > u16::MAX as usize {
+        return Err(LockdownError::Crypto("Metadata too large".to_string()));
+    }
 
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let metadata_json = serde_json::to_vec(metadata)?;
-    let metadata_len = metadata_json.len() as u16;
-
-    let mut payload = Vec::with_capacity(METADATA_LEN_SIZE + metadata_json.len() + plaintext.len());
-    payload.extend_from_slice(&metadata_len.to_be_bytes());
+    // Payload: meta_len || meta_json || plaintext, encrypted in place.
+    let mut payload = Zeroizing::new(Vec::with_capacity(2 + metadata_json.len() + plaintext.len()));
+    payload.extend_from_slice(&(metadata_json.len() as u16).to_be_bytes());
     payload.extend_from_slice(&metadata_json);
     payload.extend_from_slice(plaintext);
 
-    let encrypted = cipher
-        .encrypt(nonce, Payload { msg: &payload, aad: MAGIC })
-        .map_err(|e| LockdownError::Crypto(format!("Encryption failed: {}", e)))?;
+    let key = derive_key(&shared_secret, password_key);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_ref()));
+    let nonce_bytes = random_nonce();
+    cipher
+        .encrypt_in_place(Nonce::from_slice(&nonce_bytes), MAGIC, &mut *payload)
+        .map_err(|_| LockdownError::Crypto("Encryption failed".to_string()))?;
+    // key, shared_secret, keypair (secret key), metadata_json: zeroized on drop.
 
-    let tag_start = encrypted.len() - TAG_SIZE;
-    let mut tag = [0u8; TAG_SIZE];
-    tag.copy_from_slice(&encrypted[tag_start..]);
+    let (encrypted_sk, sk_nonce) = encrypt_secret_key(&keypair.secret_key, password_key)?;
+    debug_assert_eq!(encrypted_sk.len(), KEM_SK_SIZE + TAG_SIZE);
 
-    let ciphertext = encrypted[..tag_start].to_vec();
-
-    key.zeroize();
-    shared_secret.zeroize();
-
-    let (encrypted_sk, sk_nonce, sk_tag) = encrypt_secret_key(&keypair.secret_key, password_key)?;
-
-    Ok(EncryptionResult {
-        kem_ciphertext: kem_ct,
-        nonce: nonce_bytes,
-        metadata_ciphertext: metadata_json,
-        ciphertext,
-        tag,
-        encrypted_secret_key: encrypted_sk,
-        sk_nonce,
-        sk_tag,
-    })
+    let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    out.extend_from_slice(&kem_ct);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&encrypted_sk[..KEM_SK_SIZE]);
+    out.extend_from_slice(&sk_nonce);
+    out.extend_from_slice(&encrypted_sk[KEM_SK_SIZE..]);
+    out.extend_from_slice(&payload);
+    Ok(out)
 }
 
-pub fn decrypt_file(
-    encrypted_data: &[u8],
-    password_key: &[u8],
-) -> Result<DecryptionResult> {
-    if encrypted_data.len() < 4 + 1 + KEM_CT_SIZE + NONCE_SIZE + TAG_SIZE {
+/// Decrypt a file image produced by [`encrypt_file`].
+pub fn decrypt_file(encrypted_data: &[u8], password_key: &[u8]) -> Result<DecryptionResult> {
+    if encrypted_data.len() < HEADER_SIZE + TAG_SIZE {
         return Err(LockdownError::InvalidFormat);
     }
-
     if &encrypted_data[0..4] != MAGIC {
         return Err(LockdownError::InvalidFormat);
     }
+    if encrypted_data[OFF_VERSION] != VERSION {
+        return Err(LockdownError::Crypto(format!(
+            "Unsupported format version {:#04x} (expected {:#04x})",
+            encrypted_data[OFF_VERSION], VERSION
+        )));
+    }
 
-    let version = encrypted_data[4];
-    if version != VERSION {
+    let kem_ct = &encrypted_data[OFF_KEM_CT..OFF_KEM_CT + KEM_CT_SIZE];
+    let nonce = &encrypted_data[OFF_NONCE..OFF_NONCE + NONCE_SIZE];
+    let enc_sk = &encrypted_data[OFF_ENC_SK..OFF_ENC_SK + KEM_SK_SIZE];
+    let sk_nonce = &encrypted_data[OFF_SK_NONCE..OFF_SK_NONCE + NONCE_SIZE];
+    let sk_tag = &encrypted_data[OFF_SK_TAG..OFF_SK_TAG + TAG_SIZE];
+
+    let mut sk_blob = Vec::with_capacity(KEM_SK_SIZE + TAG_SIZE);
+    sk_blob.extend_from_slice(enc_sk);
+    sk_blob.extend_from_slice(sk_tag);
+    let secret_key = decrypt_secret_key(&sk_blob, sk_nonce, password_key)?;
+    sk_blob.zeroize();
+
+    let shared_secret = crate::crypto::kem::decapsulate(&secret_key, kem_ct)?;
+    drop(secret_key);
+
+    let key = derive_key(&shared_secret, password_key);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_ref()));
+
+    let mut payload = encrypted_data[OFF_PAYLOAD..].to_vec();
+    cipher
+        .decrypt_in_place(Nonce::from_slice(nonce), MAGIC, &mut payload)
+        .map_err(|_| LockdownError::Crypto("Authentication failed: file was modified".to_string()))?;
+    let payload = Zeroizing::new(payload);
+
+    if payload.len() < 2 {
+        return Err(LockdownError::InvalidFormat);
+    }
+    let meta_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    if payload.len() < 2 + meta_len {
         return Err(LockdownError::InvalidFormat);
     }
 
-    let kem_ct_start = 5;
-    let kem_ct_end = kem_ct_start + KEM_CT_SIZE;
-    let kem_ct = &encrypted_data[kem_ct_start..kem_ct_end];
+    let metadata: FileMetadata = serde_json::from_slice(&payload[2..2 + meta_len])?;
+    validate_original_name(&metadata.original_name)?;
 
-    let nonce_start = kem_ct_end;
-    let nonce_end = nonce_start + NONCE_SIZE;
-    let nonce = Nonce::from_slice(&encrypted_data[nonce_start..nonce_end]);
-
-    // Parse metadata length to find where the actual ciphertext starts
-    let metadata_len_start = nonce_end;
-    if encrypted_data.len() < metadata_len_start + METADATA_LEN_SIZE {
-        return Err(LockdownError::InvalidFormat);
-    }
-    let metadata_len = u16::from_be_bytes([
-        encrypted_data[metadata_len_start],
-        encrypted_data[metadata_len_start + 1],
-    ]) as usize;
-
-    let metadata_start = metadata_len_start + METADATA_LEN_SIZE;
-    let metadata_end = metadata_start + metadata_len;
-
-    // Check if we have the new format with embedded SK
-    let sk_total_size = KEM_SK_SIZE + NONCE_SIZE + TAG_SIZE;
-    let has_embedded_sk = encrypted_data.len() >= metadata_end + sk_total_size + TAG_SIZE;
-
-    let (ciphertext_start, secret_key) = if has_embedded_sk {
-        // New format: METADATA | ENCRYPTED_SK | SK_NONCE | SK_TAG | CIPHERTEXT
-        let sk_start = metadata_end;
-        let sk_nonce_start = sk_start + KEM_SK_SIZE;
-        let sk_tag_start = sk_nonce_start + NONCE_SIZE;
-        let ciphertext_start = sk_tag_start + TAG_SIZE;
-
-        let encrypted_sk = &encrypted_data[sk_start..sk_start + KEM_SK_SIZE];
-        let sk_nonce: [u8; NONCE_SIZE] = encrypted_data[sk_nonce_start..sk_nonce_start + NONCE_SIZE]
-            .try_into()
-            .map_err(|_| LockdownError::InvalidFormat)?;
-        let sk_tag: [u8; TAG_SIZE] = encrypted_data[sk_tag_start..sk_tag_start + TAG_SIZE]
-            .try_into()
-            .map_err(|_| LockdownError::InvalidFormat)?;
-
-        let sk = decrypt_secret_key(encrypted_sk, &sk_nonce, &sk_tag, password_key)?;
-        (ciphertext_start, sk)
-    } else {
-        // Old format: METADATA | CIPHERTEXT (no embedded SK)
-        // We can't decrypt without the SK, so return an error
-        return Err(LockdownError::Crypto(
-            "No embedded secret key found. Use recovery tool with .sk file.".to_string(),
-        ));
-    };
-
-    let ciphertext_end = encrypted_data.len() - TAG_SIZE;
-    let ciphertext = &encrypted_data[ciphertext_start..ciphertext_end];
-
-    let tag_start = encrypted_data.len() - TAG_SIZE;
-    let tag = &encrypted_data[tag_start..];
-
-    let mut shared_secret = crate::crypto::kem::decapsulate(&secret_key, kem_ct)?;
-    let mut key = derive_key(&shared_secret, password_key);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-
-    let mut payload = Vec::with_capacity(ciphertext.len() + TAG_SIZE);
-    payload.extend_from_slice(ciphertext);
-    payload.extend_from_slice(tag);
-
-    let decrypted = cipher
-        .decrypt(nonce, Payload { msg: &payload, aad: MAGIC })
-        .map_err(|e| LockdownError::Crypto(format!("Decryption failed: {}", e)))?;
-
-    key.zeroize();
-    shared_secret.zeroize();
-
-    if decrypted.len() < METADATA_LEN_SIZE {
-        return Err(LockdownError::InvalidFormat);
-    }
-
-    let metadata_len = u16::from_be_bytes([decrypted[0], decrypted[1]]) as usize;
-    if decrypted.len() < METADATA_LEN_SIZE + metadata_len {
-        return Err(LockdownError::InvalidFormat);
-    }
-
-    let metadata_json = &decrypted[METADATA_LEN_SIZE..METADATA_LEN_SIZE + metadata_len];
-    let metadata: FileMetadata = serde_json::from_slice(metadata_json)?;
-
-    let plaintext = decrypted[METADATA_LEN_SIZE + metadata_len..].to_vec();
-
+    let plaintext = Zeroizing::new(payload[2 + meta_len..].to_vec());
     Ok(DecryptionResult { metadata, plaintext })
 }
 
-#[allow(dead_code)]
-pub fn decrypt_file_with_sk(
-    encrypted_data: &[u8],
-    secret_key: &[u8],
-    password_key: &[u8],
-) -> Result<DecryptionResult> {
-    if encrypted_data.len() < 4 + 1 + KEM_CT_SIZE + NONCE_SIZE + TAG_SIZE {
-        return Err(LockdownError::InvalidFormat);
-    }
-
-    if &encrypted_data[0..4] != MAGIC {
-        return Err(LockdownError::InvalidFormat);
-    }
-
-    let version = encrypted_data[4];
-    if version != VERSION {
-        return Err(LockdownError::InvalidFormat);
-    }
-
-    let kem_ct_start = 5;
-    let kem_ct_end = kem_ct_start + KEM_CT_SIZE;
-    let kem_ct = &encrypted_data[kem_ct_start..kem_ct_end];
-
-    let nonce_start = kem_ct_end;
-    let nonce_end = nonce_start + NONCE_SIZE;
-    let nonce = Nonce::from_slice(&encrypted_data[nonce_start..nonce_end]);
-
-    // First, extract metadata length to find where actual ciphertext starts
-    let metadata_len_start = nonce_end;
-    if encrypted_data.len() < metadata_len_start + METADATA_LEN_SIZE {
-        return Err(LockdownError::InvalidFormat);
-    }
-    let metadata_len = u16::from_be_bytes([
-        encrypted_data[metadata_len_start],
-        encrypted_data[metadata_len_start + 1],
-    ]) as usize;
-
-    let metadata_start = metadata_len_start + METADATA_LEN_SIZE;
-    let metadata_end = metadata_start + metadata_len;
-    if encrypted_data.len() < metadata_end + TAG_SIZE {
-        return Err(LockdownError::InvalidFormat);
-    }
-
-    let ciphertext_start = metadata_end;
-    let ciphertext_end = encrypted_data.len() - TAG_SIZE;
-    let ciphertext = &encrypted_data[ciphertext_start..ciphertext_end];
-
-    let tag_start = encrypted_data.len() - TAG_SIZE;
-    let tag = &encrypted_data[tag_start..];
-
-    let mut shared_secret = crate::crypto::kem::decapsulate(secret_key, kem_ct)?;
-    let mut key = derive_key(&shared_secret, password_key);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-
-    let mut payload = Vec::with_capacity(ciphertext.len() + TAG_SIZE);
-    payload.extend_from_slice(ciphertext);
-    payload.extend_from_slice(tag);
-
-    let decrypted = cipher
-        .decrypt(nonce, Payload { msg: &payload, aad: MAGIC })
-        .map_err(|e| LockdownError::Crypto(format!("Decryption failed: {}", e)))?;
-
-    key.zeroize();
-    shared_secret.zeroize();
-
-    if decrypted.len() < METADATA_LEN_SIZE {
-        return Err(LockdownError::InvalidFormat);
-    }
-
-    let metadata_len = u16::from_be_bytes([decrypted[0], decrypted[1]]) as usize;
-    if decrypted.len() < METADATA_LEN_SIZE + metadata_len {
-        return Err(LockdownError::InvalidFormat);
-    }
-
-    let metadata_json = &decrypted[METADATA_LEN_SIZE..METADATA_LEN_SIZE + metadata_len];
-    let metadata: FileMetadata = serde_json::from_slice(metadata_json)?;
-
-    let plaintext = decrypted[METADATA_LEN_SIZE + metadata_len..].to_vec();
-
-    Ok(DecryptionResult { metadata, plaintext })
-}
-
-#[allow(dead_code)]
-pub fn serialize_encrypted(result: &EncryptionResult) -> Vec<u8> {
-    let metadata_len = result.metadata_ciphertext.len() as u16;
-    let mut out = Vec::with_capacity(
-        4 + 1 + KEM_CT_SIZE + NONCE_SIZE + METADATA_LEN_SIZE
-            + result.metadata_ciphertext.len() + result.ciphertext.len() + TAG_SIZE,
-    );
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    out.extend_from_slice(&result.kem_ciphertext);
-    out.extend_from_slice(&result.nonce);
-    out.extend_from_slice(&metadata_len.to_be_bytes());
-    out.extend_from_slice(&result.metadata_ciphertext);
-    out.extend_from_slice(&result.ciphertext);
-    out.extend_from_slice(&result.tag);
-    out
-}
-
-pub fn serialize_encrypted_with_sk(result: &EncryptionResult) -> Vec<u8> {
-    let metadata_len = result.metadata_ciphertext.len() as u16;
-    let mut out = Vec::with_capacity(
-        4 + 1 + KEM_CT_SIZE + NONCE_SIZE + METADATA_LEN_SIZE
-            + result.metadata_ciphertext.len()
-            + KEM_SK_SIZE + NONCE_SIZE + TAG_SIZE  // encrypted SK
-            + result.ciphertext.len() + TAG_SIZE,
-    );
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    out.extend_from_slice(&result.kem_ciphertext);
-    out.extend_from_slice(&result.nonce);
-    out.extend_from_slice(&metadata_len.to_be_bytes());
-    out.extend_from_slice(&result.metadata_ciphertext);
-    out.extend_from_slice(&result.encrypted_secret_key);
-    out.extend_from_slice(&result.sk_nonce);
-    out.extend_from_slice(&result.sk_tag);
-    out.extend_from_slice(&result.ciphertext);
-    out.extend_from_slice(&result.tag);
-    out
-}
-
+/// Content sniffing for the scanner. Accepts any LOCK version so legacy files
+/// still classify as encrypted (decrypt then reports the version mismatch).
 pub fn is_encrypted_file(data: &[u8]) -> bool {
-    data.len() >= 5 && &data[0..4] == MAGIC && data[4] == VERSION
+    data.len() >= 5 && &data[0..4] == MAGIC && data[4] >= 0x01
 }

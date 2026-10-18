@@ -47,29 +47,31 @@ Lockdown uses a hybrid cryptosystem designed to survive quantum computers:
 8. The plaintext is written back to the original name in the same folder
 9. The encrypted file is removed
 
-### The `.lock` File Format
+### The `.lock` File Format (v2)
 
-Every encrypted file is a self-contained binary blob:
+Every encrypted file is a self-contained binary blob with a fixed 4781-byte header. Nothing variable-length is parsed before authentication:
 
 ```
 ┌─────────────┬──────────┬─────────────────────────────────────┐
 │   Field     │   Size   │           Description               │
 ├─────────────┼──────────┼─────────────────────────────────────┤
 │ Magic       │ 4 bytes  │ "LOCK" (0x4C4F434B)                 │
-│ Version     │ 1 byte   │ 0x01                                │
+│ Version     │ 1 byte   │ 0x02                                │
 │ KEM CT      │ 1568 B   │ ML-KEM-1024 encapsulated key        │
 │ Nonce       │ 12 bytes │ Random AES-GCM nonce                │
-│ Meta Len    │ 2 bytes  │ Length of encrypted metadata        │
-│ Metadata CT │ Variable │ Encrypted JSON: name, path, size    │
 │ Encrypted SK│ 3168 B   │ ML-KEM secret key, AES-encrypted    │
 │ SK Nonce    │ 12 bytes │ Nonce for SK encryption             │
 │ SK Tag      │ 16 bytes │ GCM tag for SK encryption           │
-│ Ciphertext  │ Variable │ Encrypted file content              │
+│ Ciphertext  │ Variable │ Encrypted: meta_len(2B) + JSON      │
+│             │          │ metadata (name, path, size) +       │
+│             │          │ file content                        │
 │ Tag         │ 16 bytes │ GCM authentication tag              │
 └─────────────┴──────────┴─────────────────────────────────────┘
 ```
 
-The metadata and the secret key are both encrypted, so the original filename and the means to decrypt are never exposed on disk.
+Metadata lives only inside the authenticated ciphertext, so the original filename is never exposed on disk — not even in the header. (v0.1 wrote plaintext metadata into the header; v0.2 files are not compatible with v0.1.)
+
+Writes are atomic (temp file + rename), so a crash mid-operation can never leave a truncated file behind.
 
 ## Stealth Modes
 
@@ -166,6 +168,7 @@ lockdown/
 │   ├── main.rs             # App entry point
 │   ├── lib.rs              # Library exports
 │   ├── error.rs            # Error types
+│   ├── fileutil.rs         # Atomic writes, secure delete
 │   ├── auth/
 │   │   ├── mod.rs
 │   │   └── password.rs     # Argon2id password handling
@@ -182,8 +185,9 @@ lockdown/
 │   │   └── attributes.rs   # Hidden/system file attributes
 │   └── ui/
 │       ├── mod.rs
-│       ├── app.rs          # egui application logic
-│       └── panels.rs       # Reserved for future components
+│       └── app.rs          # egui application logic
+├── tests/
+│   └── integration.rs      # Crypto, auth, scanner, I/O round-trips
 └── .lockdown/              # Created at runtime
     ├── auth                # Argon2id password hash
     └── vault/              # Hidden storage for Hide mode
@@ -204,18 +208,18 @@ lockdown/
 
 ## Known Limitations
 
-1. No secure delete: original files are deleted with a simple `remove_file`, not overwritten.
-2. No auto-lock: the app stays unlocked until closed.
-3. No file integrity index: if you rename or move encrypted files outside the app, the metadata index becomes stale.
-4. No drag-and-drop: you have to click to select files, then click encrypt or decrypt.
+1. Secure delete is best-effort: originals are overwritten with random bytes before unlink, but CoW filesystems and wear-leveled SSDs may retain copies.
+2. Whole-file operation: files are encrypted in memory, so very large files need roughly 2× their size in RAM.
+3. No drag-and-drop: you have to click to select files, then click encrypt or decrypt.
 
 ## Roadmap
 
-- [ ] Secure delete (3-pass overwrite)
-- [ ] Auto-lock after idle timeout
+- [x] Secure delete (random-overwrite before unlink)
+- [x] Auto-lock after idle timeout (5 minutes)
+- [x] Unlock rate-limiting with exponential backoff
 - [ ] Drag-and-drop between panes
 - [ ] File search and filtering
-- [ ] Encrypted metadata index for Hide mode
+- [ ] Streaming encryption for very large files
 - [ ] CLI mode for scripting
 
 ## License

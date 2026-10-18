@@ -1,11 +1,5 @@
-mod auth;
-mod crypto;
-mod error;
-mod scanner;
-mod stealth;
-mod ui;
-
 use eframe::egui;
+use lockdown::ui::LockdownApp;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -19,6 +13,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Lockdown",
         options,
-        Box::new(|cc| Box::new(ui::LockdownApp::new(cc))),
+        Box::new(|cc| Box::new(LockdownApp::new(cc))),
     )
 }
